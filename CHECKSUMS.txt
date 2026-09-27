@@ -23,3 +23,6 @@ Experimental T10 IPA:
 
 Experimental T10 main executable:
 68eb7008f2c036177c81b60decfe01f7ca33059012cf49404a2a7c8ffe827f7a  XeniOS (T10)
+
+T12 source backport IPA (built, pre-install verified):
+a7730e7ba39d094581b2812c2dddbcb7043adeb5ca595c14c7758f60da803c74  XeniOS_2.0.1_iOS16_T12_SOURCE_BACKPORT.ipa
