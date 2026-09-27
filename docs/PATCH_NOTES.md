@@ -85,3 +85,45 @@ Reference tested T10 IPA SHA-256:
 ```
 
 Latest result: the earlier mutex analytics crash was no longer produced, but Forza Motorsport 4 still did not boot. `xenia.log` showed repeated `BaseHeap::AllocFixed attempting commit on unreserved page` warnings. More testing with a second, simpler title is required before changing guest memory behavior.
+
+
+## T11 — diagnostic fatal-error build
+
+T11 keeps the T10 clock bypass but changes the iOS fatal-error path to call `abort()` rather than exiting cleanly. The goal is diagnostic: if game startup reaches XeniOS's `FatalError()`, iOS should generate a crash report while `xenia.log` is flushed.
+
+Testing with Project Gotham Racing 3 reproduced the same immediate game-start failure seen with Forza Motorsport 4, confirming the problem is not specific to one demanding title.
+
+The resulting `xenia.log` identified the actual next blocker:
+
+- Metal reported BC texture compression is unavailable and selected decompression.
+- The embedded `texture_load` library failed to load because its format / deployment target is newer than the running OS.
+- Repeated `entry_xe` pipeline creation errors reported deployment target `0x00020007` versus running OS `0x00020005`.
+- Metal texture-cache initialization then failed.
+- Command-processor internal-state setup failed and entered the XeniOS fatal-error path.
+
+The earlier `BaseHeap::AllocFixed attempting commit on unreserved page` messages are therefore not the immediate game-start blocker; execution continues beyond them into Metal initialization.
+
+## T12 — source-level iOS 16 rebuild
+
+Binary patching Metal library deployment metadata is intentionally avoided. T12 instead rebuilds the exact upstream revision embedded in build 9849:
+
+```text
+upstream commitShort: acfa2878a
+```
+
+The source build changes the iOS deployment target from 18.0 to 16.0 **before CMake configuration**. This is important because XeniOS forwards `CMAKE_OSX_DEPLOYMENT_TARGET` to its Metal shader compiler as `-miphoneos-version-min=...`, so the embedded `texture_load` metallibs are regenerated with an actual iOS 16 target.
+
+T12 also carries source-level equivalents of the proven backport requirements:
+
+- iOS fatal errors use `abort()` instead of unavailable `quick_exit()`.
+- `at_quick_exit` is avoided on iOS.
+- the T10 `clock_no_scaling` behavior is preserved for continuity.
+- Metal residency sets default to disabled on iOS 16 testing.
+
+The build workflow lives at:
+
+```text
+.github/workflows/build-t12-ios16.yml
+```
+
+T9 remains the frozen frontend-launch baseline until T12 is field-validated.
