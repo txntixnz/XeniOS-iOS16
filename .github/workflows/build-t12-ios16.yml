@@ -1,0 +1,168 @@
+name: Build T12 iOS16 source backport
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-t12-ios16.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-t12:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout backport repo
+        uses: actions/checkout@v4
+
+      - name: Checkout exact upstream XeniOS build 9849 source
+        run: |
+          git clone https://github.com/xenios-jp/XeniOS.git upstream
+          cd upstream
+          git checkout acfa2878a
+          git submodule update --init --depth=1 -j$(sysctl -n hw.ncpu) \
+            $(grep -oE 'path = .+' .gitmodules | sed 's/path = //')
+          git -C third_party/DirectXShaderCompiler submodule update --init --depth=1 \
+            external/SPIRV-Headers external/SPIRV-Tools
+          git submodule update --init --recursive --depth=1 \
+            -j$(sysctl -n hw.ncpu) third_party/wxWidgets
+
+      - name: Apply iOS 16 source backport
+        working-directory: upstream
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # The key fix: this value is consumed by CMake before project() and
+          # forwarded to xenia-shader-cc as -miphoneos-version-min, so embedded
+          # metallibs are genuinely compiled for iOS 16 rather than hex-patched.
+          p = Path("CMakeLists.txt")
+          s = p.read_text()
+          old = 'set(CMAKE_OSX_DEPLOYMENT_TARGET "18.0" CACHE STRING "Minimum iOS version")'
+          new = 'set(CMAKE_OSX_DEPLOYMENT_TARGET "16.0" CACHE STRING "Minimum iOS version")'
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # iOS 16 libSystem lacks quick_exit / at_quick_exit.
+          p = Path("src/xenia/base/logging.cc")
+          s = p.read_text()
+          old = "#if XE_PLATFORM_ANDROID\n  // Throw an error that can be reported to the developers via the store.\n  std::abort();"
+          new = "#if XE_PLATFORM_ANDROID || XE_PLATFORM_IOS\n  // iOS 16 has no quick_exit; abort also preserves a useful crash report.\n  std::abort();"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/base/memory_posix.cc")
+          s = p.read_text()
+          old = "  std::atexit(CleanupAtExit);\n  std::at_quick_exit(CleanupAtExit);"
+          new = "  std::atexit(CleanupAtExit);\n#if !XE_PLATFORM_IOS\n  std::at_quick_exit(CleanupAtExit);\n#endif"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/app/xenia_main.cc")
+          s = p.read_text()
+          old = "  xe::FlushLog();\n  std::quick_exit(EXIT_SUCCESS);"
+          new = "  xe::FlushLog();\n#if XE_PLATFORM_IOS\n  std::_Exit(EXIT_SUCCESS);\n#else\n  std::quick_exit(EXIT_SUCCESS);\n#endif"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # Preserve the T10 experiment that got game startup past the mutex
+          # system_error on the iOS 16 binary backport.
+          p = Path("src/xenia/base/clock.cc")
+          s = p.read_text()
+          old = "DEFINE_bool(clock_no_scaling, false,"
+          new = "DEFINE_bool(clock_no_scaling, true,"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # Avoid newer Metal residency-set APIs on iOS 16.
+          p = Path("src/xenia/gpu/gpu_flags.cc")
+          s = p.read_text()
+          old = 'metal_residency_sets, "auto",'
+          new = 'metal_residency_sets, "false",'
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+          echo "Patched deployment target:"
+          grep -n 'CMAKE_OSX_DEPLOYMENT_TARGET "16.0"' CMakeLists.txt
+          echo "Patched clock default:"
+          grep -n 'DEFINE_bool(clock_no_scaling' src/xenia/base/clock.cc
+          echo "Patched residency-set default:"
+          grep -n 'metal_residency_sets, "false"' src/xenia/gpu/gpu_flags.cc
+
+      - name: Fetch XeniOS data repositories
+        working-directory: upstream
+        run: ./xenia-build.py fetchdata
+
+      - name: Install Apple Metal Toolchain
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if sudo xcodebuild -downloadComponent MetalToolchain; then
+              exit 0
+            fi
+            sleep $((attempt * 30))
+          done
+          exit 1
+
+      - name: Build and package iOS 16 IPA
+        working-directory: upstream
+        run: |
+          tools/build_apple_release.sh \
+            --out scratch/t12 \
+            --config release \
+            --version 2.0.1 \
+            --build-number 9849 \
+            --channel preview \
+            --stage stable \
+            --ios-min 16.0 \
+            --ios-bundle-id com.xenios.ios16.t12 \
+            --skip-macos-arm64 \
+            --skip-macos-x86_64 \
+            --skip-macos-universal
+
+      - name: Stamp T12 test name and re-sign
+        working-directory: upstream
+        run: |
+          IPA="scratch/t12/xenios_ios_iphone_ipad.ipa"
+          TMP="$(mktemp -d)"
+          ditto -x -k "$IPA" "$TMP"
+          APP="$(find "$TMP/Payload" -maxdepth 1 -name '*.app' -type d | head -n1)"
+          /usr/libexec/PlistBuddy -c "Delete :CFBundleDisplayName" "$APP/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string XeniOS iOS16 T12" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Delete :MinimumOSVersion" "$APP/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string 16.0" "$APP/Info.plist"
+
+          # Re-sign embedded dylibs then app ad-hoc. TrollStore can re-sign again.
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -name '*.dylib' -type f -print0 | \
+              xargs -0 -I{} codesign --force --sign - --timestamp=none "{}"
+          fi
+          codesign --force --sign - --timestamp=none \
+            --entitlements xenia_ios.entitlements "$APP"
+
+          rm -f "$IPA"
+          (cd "$TMP" && zip -qry "$GITHUB_WORKSPACE/upstream/$IPA" Payload)
+          shasum -a 256 "$IPA"
+
+      - name: Verify Mach-O and plist deployment targets
+        working-directory: upstream
+        run: |
+          IPA="scratch/t12/xenios_ios_iphone_ipad.ipa"
+          TMP="$(mktemp -d)"
+          ditto -x -k "$IPA" "$TMP"
+          APP="$(find "$TMP/Payload" -maxdepth 1 -name '*.app' -type d | head -n1)"
+          echo "Info.plist MinimumOSVersion:"
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist"
+          echo "Main executable build version:"
+          xcrun vtool -show-build "$APP/XeniOS"
+          echo "DXIL converter build version:"
+          xcrun vtool -show-build "$APP/Frameworks/libdxilconv.dylib" || true
+
+      - name: Upload T12 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: XeniOS-iOS16-T12-source-backport
+          path: upstream/scratch/t12/xenios_ios_iphone_ipad.ipa
+          if-no-files-found: error
