@@ -86,6 +86,15 @@ jobs:
           # Xcode 15 / iOS 17 SDK cannot parse the iOS 26 UIGlassEffect types
           # even though the code is guarded with @available. Compile the same
           # pre-glass fallback path directly for this legacy-toolchain build.
+          # Older Clang rejects static_cast<uint32_t -> union AttributeKey>.
+          # This is byte-for-byte equivalent to the constructors below it.
+          p = Path("src/xenia/kernel/xam/user_property.cc")
+          s = p.read_text()
+          old = "  property_id_ = static_cast<AttributeKey>(property_id);"
+          new = "  property_id_.value = property_id;"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
           p = Path("src/xenia/ui/ios/shared/ios_view_helpers.mm")
           s = p.read_text()
           old = (
