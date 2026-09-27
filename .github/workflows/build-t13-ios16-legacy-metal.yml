@@ -82,6 +82,27 @@ jobs:
           new = 'metal_residency_sets, "false",'
           assert old in s
           p.write_text(s.replace(old, new, 1))
+
+          # Xcode 15 / iOS 17 SDK cannot parse the iOS 26 UIGlassEffect types
+          # even though the code is guarded with @available. Compile the same
+          # pre-glass fallback path directly for this legacy-toolchain build.
+          p = Path("src/xenia/ui/ios/shared/ios_view_helpers.mm")
+          s = p.read_text()
+          old = """UIVisualEffect* xe_make_chrome_visual_effect(BOOL clear_variant) {
+  if (@available(iOS 26.0, *)) {
+    UIGlassEffectStyle style =
+        clear_variant ? UIGlassEffectStyleClear : UIGlassEffectStyleRegular;
+    return [UIGlassEffect effectWithStyle:style];
+  }
+  // iOS 18-25 fallback: the closest pre-glass UIBlurEffect for each variant.
+"""
+          new = """UIVisualEffect* xe_make_chrome_visual_effect(BOOL clear_variant) {
+  // Legacy Xcode 15 build: UIGlassEffect is an iOS 26 SDK type and is not
+  // declared by the iOS 17 SDK. iOS 16 uses this blur fallback anyway.
+  // iOS 18-25 fallback: the closest pre-glass UIBlurEffect for each variant.
+"""
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
           PY
 
       - name: Fetch XeniOS data repositories
