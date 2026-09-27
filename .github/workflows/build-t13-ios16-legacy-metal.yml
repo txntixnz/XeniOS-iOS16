@@ -88,19 +88,21 @@ jobs:
           # pre-glass fallback path directly for this legacy-toolchain build.
           p = Path("src/xenia/ui/ios/shared/ios_view_helpers.mm")
           s = p.read_text()
-          old = """UIVisualEffect* xe_make_chrome_visual_effect(BOOL clear_variant) {
-  if (@available(iOS 26.0, *)) {
-    UIGlassEffectStyle style =
-        clear_variant ? UIGlassEffectStyleClear : UIGlassEffectStyleRegular;
-    return [UIGlassEffect effectWithStyle:style];
-  }
-  // iOS 18-25 fallback: the closest pre-glass UIBlurEffect for each variant.
-"""
-          new = """UIVisualEffect* xe_make_chrome_visual_effect(BOOL clear_variant) {
-  // Legacy Xcode 15 build: UIGlassEffect is an iOS 26 SDK type and is not
-  // declared by the iOS 17 SDK. iOS 16 uses this blur fallback anyway.
-  // iOS 18-25 fallback: the closest pre-glass UIBlurEffect for each variant.
-"""
+          old = (
+              "UIVisualEffect* xe_make_chrome_visual_effect(BOOL clear_variant) {\n"
+              "  if (@available(iOS 26.0, *)) {\n"
+              "    UIGlassEffectStyle style =\n"
+              "        clear_variant ? UIGlassEffectStyleClear : UIGlassEffectStyleRegular;\n"
+              "    return [UIGlassEffect effectWithStyle:style];\n"
+              "  }\n"
+              "  // iOS 18-25 fallback: the closest pre-glass UIBlurEffect for each variant.\n"
+          )
+          new = (
+              "UIVisualEffect* xe_make_chrome_visual_effect(BOOL clear_variant) {\n"
+              "  // Legacy Xcode 15 build: UIGlassEffect is an iOS 26 SDK type and is not\n"
+              "  // declared by the iOS 17 SDK. iOS 16 uses this blur fallback anyway.\n"
+              "  // iOS 18-25 fallback: the closest pre-glass UIBlurEffect for each variant.\n"
+          )
           assert old in s
           p.write_text(s.replace(old, new, 1))
           PY
