@@ -1,0 +1,152 @@
+name: Build T13 iOS16 legacy Metal
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-t13-ios16-legacy-metal.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-t13:
+    runs-on: macos-14
+    timeout-minutes: 150
+    steps:
+      - name: Checkout backport repo
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 15.0.1
+        run: |
+          sudo xcode-select -s /Applications/Xcode_15.0.1.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Checkout exact upstream XeniOS build 9849 source
+        run: |
+          git clone https://github.com/xenios-jp/XeniOS.git upstream
+          cd upstream
+          git checkout acfa2878a
+          git submodule update --init --depth=1 -j$(sysctl -n hw.ncpu) \
+            $(grep -oE 'path = .+' .gitmodules | sed 's/path = //')
+          git -C third_party/DirectXShaderCompiler submodule update --init --depth=1 \
+            external/SPIRV-Headers external/SPIRV-Tools
+          git submodule update --init --recursive --depth=1 \
+            -j$(sysctl -n hw.ncpu) third_party/wxWidgets
+
+      - name: Apply iOS 16 source backport
+        working-directory: upstream
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("CMakeLists.txt")
+          s = p.read_text()
+          old = 'set(CMAKE_OSX_DEPLOYMENT_TARGET "18.0" CACHE STRING "Minimum iOS version")'
+          new = 'set(CMAKE_OSX_DEPLOYMENT_TARGET "16.0" CACHE STRING "Minimum iOS version")'
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/base/logging.cc")
+          s = p.read_text()
+          old = "#if XE_PLATFORM_ANDROID\n  // Throw an error that can be reported to the developers via the store.\n  std::abort();"
+          new = "#if XE_PLATFORM_ANDROID || XE_PLATFORM_IOS\n  // iOS 16 has no quick_exit; abort also preserves a useful crash report.\n  std::abort();"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/base/memory_posix.cc")
+          s = p.read_text()
+          old = "  std::atexit(CleanupAtExit);\n  std::at_quick_exit(CleanupAtExit);"
+          new = "  std::atexit(CleanupAtExit);\n#if !XE_PLATFORM_IOS\n  std::at_quick_exit(CleanupAtExit);\n#endif"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/app/xenia_main.cc")
+          s = p.read_text()
+          old = "  xe::FlushLog();\n  std::quick_exit(EXIT_SUCCESS);"
+          new = "  xe::FlushLog();\n#if XE_PLATFORM_IOS\n  std::_Exit(EXIT_SUCCESS);\n#else\n  std::quick_exit(EXIT_SUCCESS);\n#endif"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/base/clock.cc")
+          s = p.read_text()
+          old = "DEFINE_bool(clock_no_scaling, false,"
+          new = "DEFINE_bool(clock_no_scaling, true,"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/gpu/gpu_flags.cc")
+          s = p.read_text()
+          old = 'metal_residency_sets, "auto",'
+          new = 'metal_residency_sets, "false",'
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Fetch XeniOS data repositories
+        working-directory: upstream
+        run: ./xenia-build.py fetchdata
+
+      - name: Verify legacy Metal compiler
+        run: |
+          xcrun --sdk iphoneos metal --version || true
+          echo 'kernel void xenios_probe(device uint* p [[buffer(0)]], uint i [[thread_position_in_grid]]) { p[i] = i; }' > /tmp/probe.metal
+          xcrun --sdk iphoneos metal -std=ios-metal2.3 -miphoneos-version-min=16.0 -c /tmp/probe.metal -o /tmp/probe.air
+          strings /tmp/probe.air | grep -E 'air64|apple-ios' | head -20 || true
+
+      - name: Build and package T13
+        working-directory: upstream
+        run: |
+          tools/build_apple_release.sh \
+            --out scratch/t13 \
+            --config release \
+            --version 2.0.1 \
+            --build-number 9849 \
+            --channel preview \
+            --stage stable \
+            --ios-min 16.0 \
+            --ios-bundle-id com.xenios.ios16.t13 \
+            --skip-macos-arm64 \
+            --skip-macos-x86_64 \
+            --skip-macos-universal
+
+      - name: Stamp T13 test name and re-sign
+        working-directory: upstream
+        run: |
+          IPA="scratch/t13/xenios_ios_iphone_ipad.ipa"
+          TMP="$(mktemp -d)"
+          ditto -x -k "$IPA" "$TMP"
+          APP="$(find "$TMP/Payload" -maxdepth 1 -name '*.app' -type d | head -n1)"
+          /usr/libexec/PlistBuddy -c "Delete :CFBundleDisplayName" "$APP/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string XeniOS iOS16 T13" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Delete :MinimumOSVersion" "$APP/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string 16.0" "$APP/Info.plist"
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -name '*.dylib' -type f -print0 | \
+              xargs -0 -I{} codesign --force --sign - --timestamp=none "{}"
+          fi
+          codesign --force --sign - --timestamp=none \
+            --entitlements xenia_ios.entitlements "$APP"
+          rm -f "$IPA"
+          (cd "$TMP" && zip -qry "$GITHUB_WORKSPACE/upstream/$IPA" Payload)
+          shasum -a 256 "$IPA"
+
+      - name: Inspect embedded Metal target strings
+        working-directory: upstream
+        run: |
+          IPA="scratch/t13/xenios_ios_iphone_ipad.ipa"
+          TMP="$(mktemp -d)"
+          ditto -x -k "$IPA" "$TMP"
+          APP="$(find "$TMP/Payload" -maxdepth 1 -name '*.app' -type d | head -n1)"
+          echo "Main executable:"
+          xcrun vtool -show-build "$APP/XeniOS"
+          echo "Metal AIR target strings:"
+          strings "$APP/XeniOS" | grep -E 'air64_v[0-9]+-apple-ios' | sort | uniq -c | head -50 || true
+
+      - name: Upload T13 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: XeniOS-iOS16-T13-legacy-metal
+          path: upstream/scratch/t13/xenios_ios_iphone_ipad.ipa
+          if-no-files-found: error
