@@ -1,0 +1,302 @@
+name: Build T14 iOS16 runtime Metal source
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-t14-ios16-runtime-metal.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-t14:
+    runs-on: macos-14
+    timeout-minutes: 150
+    steps:
+      - name: Checkout backport repo
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 15.0.1
+        run: |
+          sudo xcode-select -s /Applications/Xcode_15.0.1.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Checkout exact upstream XeniOS build 9849 source
+        run: |
+          git clone https://github.com/xenios-jp/XeniOS.git upstream
+          cd upstream
+          git checkout acfa2878a
+          git submodule update --init --depth=1 -j$(sysctl -n hw.ncpu) \
+            $(grep -oE 'path = .+' .gitmodules | sed 's/path = //')
+          git -C third_party/DirectXShaderCompiler submodule update --init --depth=1 \
+            external/SPIRV-Headers external/SPIRV-Tools
+          git submodule update --init --recursive --depth=1 \
+            -j$(sysctl -n hw.ncpu) third_party/wxWidgets
+
+      - name: Apply iOS 16 source backport
+        working-directory: upstream
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("CMakeLists.txt")
+          s = p.read_text()
+          old = 'set(CMAKE_OSX_DEPLOYMENT_TARGET "18.0" CACHE STRING "Minimum iOS version")'
+          new = 'set(CMAKE_OSX_DEPLOYMENT_TARGET "16.0" CACHE STRING "Minimum iOS version")'
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/base/logging.cc")
+          s = p.read_text()
+          old = "#if XE_PLATFORM_ANDROID\n  // Throw an error that can be reported to the developers via the store.\n  std::abort();"
+          new = "#if XE_PLATFORM_ANDROID || XE_PLATFORM_IOS\n  // iOS 16 has no quick_exit; abort also preserves a useful crash report.\n  std::abort();"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/base/memory_posix.cc")
+          s = p.read_text()
+          old = "  std::atexit(CleanupAtExit);\n  std::at_quick_exit(CleanupAtExit);"
+          new = "  std::atexit(CleanupAtExit);\n#if !XE_PLATFORM_IOS\n  std::at_quick_exit(CleanupAtExit);\n#endif"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/app/xenia_main.cc")
+          s = p.read_text()
+          old = "  xe::FlushLog();\n  std::quick_exit(EXIT_SUCCESS);"
+          new = "  xe::FlushLog();\n#if XE_PLATFORM_IOS\n  std::_Exit(EXIT_SUCCESS);\n#else\n  std::quick_exit(EXIT_SUCCESS);\n#endif"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/base/clock.cc")
+          s = p.read_text()
+          old = "DEFINE_bool(clock_no_scaling, false,"
+          new = "DEFINE_bool(clock_no_scaling, true,"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/gpu/gpu_flags.cc")
+          s = p.read_text()
+          old = 'metal_residency_sets, "auto",'
+          new = 'metal_residency_sets, "false",'
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # Xcode 15 / iOS 17 SDK cannot parse the iOS 26 UIGlassEffect types
+          # even though the code is guarded with @available. Compile the same
+          # pre-glass fallback path directly for this legacy-toolchain build.
+          # Older Clang rejects static_cast<uint32_t -> union AttributeKey>.
+          # This is byte-for-byte equivalent to the constructors below it.
+          p = Path("src/xenia/kernel/xam/user_property.cc")
+          s = p.read_text()
+          old = "  property_id_ = static_cast<AttributeKey>(property_id);"
+          new = "  property_id_.value = property_id;"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # Xcode 15 / iOS 17 SDK lacks newer PHASE automatic head-tracking
+          # APIs. iOS 16 uses the fixed-listener path, so compile that path only.
+          p = Path("src/xenia/apu/phase/phase_audio_driver.mm")
+          s = p.read_text()
+          old = (
+              "    if (cvars::apu_phase_head_tracking) {\n"
+              "      d->listener.automaticHeadTrackingFlags =\n"
+              "          PHASEAutomaticHeadTrackingFlagOrientation;\n"
+              "      XELOGI(\"PHASEAudioDriver: automatic head tracking ENABLED\");\n"
+              "    } else {\n"
+              "      XELOGI(\"PHASEAudioDriver: head tracking disabled (fixed listener)\");\n"
+              "    }\n"
+          )
+          new = (
+              "    XELOGI(\"PHASEAudioDriver: head tracking disabled (fixed listener)\");\n"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # T14: For texture_load shaders, emit preprocessed MSL source
+          # bytes (NUL-terminated) instead of an offline metallib. iOS 16 will
+          # compile this source with its own Metal runtime, avoiding newer
+          # metallib container/IR compatibility problems.
+          p = Path("tools/build/shader_cc.cc")
+          s = p.read_text()
+          old = (
+              "    auto lib_path = tmp_dir / (tag + \".metallib\");\n\n"
+              "    auto cleanup = [&] {\n"
+              "      std::error_code ec;\n"
+              "      std::filesystem::remove(air_path, ec);\n"
+              "      std::filesystem::remove(lib_path, ec);\n"
+              "    };\n"
+          )
+          new = (
+              "    auto lib_path = tmp_dir / (tag + \".metallib\");\n"
+              "    auto source_path = tmp_dir / (tag + \".metal\");\n\n"
+              "    auto cleanup = [&] {\n"
+              "      std::error_code ec;\n"
+              "      std::filesystem::remove(air_path, ec);\n"
+              "      std::filesystem::remove(lib_path, ec);\n"
+              "      std::filesystem::remove(source_path, ec);\n"
+              "    };\n"
+          )
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = (
+              "    if (RunCommand({\"xcrun\", \"-sdk\", metal_sdk, \"metallib\", air_path.string(),\n"
+              "                    \"-o\", lib_path.string()}) != 0) {\n"
+          )
+          inject = (
+              "    const bool runtime_source =\n"
+              "        identifier.rfind(\"texture_load_\", 0) == 0 ||\n"
+              "        identifier == \"texture_upload_repack\";\n"
+              "    if (runtime_source) {\n"
+              "      std::vector<std::string> pp_cmd = {\n"
+              "          \"xcrun\", \"-sdk\", metal_sdk, \"metal\", \"-x\", \"metal\",\n"
+              "          \"-std=\" + metal_std, metal_min_version_flag, \"-D\",\n"
+              "          \"SHADING_LANGUAGE_MSL_XE=1\", \"-w\"};\n"
+              "      AppendDefines(&pp_cmd, defines, \"-D\");\n"
+              "      if (!input_dir.empty()) {\n"
+              "        pp_cmd.push_back(\"-I\");\n"
+              "        pp_cmd.push_back(input_dir);\n"
+              "      }\n"
+              "      pp_cmd.push_back(\"-E\");\n"
+              "      pp_cmd.push_back(input_path.string());\n"
+              "      pp_cmd.push_back(\"-o\");\n"
+              "      pp_cmd.push_back(source_path.string());\n"
+              "      if (RunCommand(pp_cmd) != 0) {\n"
+              "        std::fprintf(stderr, \"metal preprocess failed for %s\\n\",\n"
+              "                     input_path.string().c_str());\n"
+              "        cleanup();\n"
+              "        return 1;\n"
+              "      }\n"
+              "      std::vector<uint8_t> source_bytes;\n"
+              "      if (!ReadBinaryFile(source_path, &source_bytes)) {\n"
+              "        cleanup();\n"
+              "        return 1;\n"
+              "      }\n"
+              "      source_bytes.push_back(0);\n"
+              "      cleanup();\n"
+              "      return WriteMetallibHeader(output_path, identifier, source_bytes) ? 0 : 1;\n"
+              "    }\n\n"
+          )
+          assert old in s
+          s = s.replace(old, inject + old, 1)
+          p.write_text(s)
+
+          # T14 texture cache: the generated texture_load_*_metallib arrays
+          # contain NUL-terminated preprocessed MSL source. Compile them on the
+          # device with its native Metal compiler.
+          p = Path("src/xenia/gpu/metal/metal_texture_cache.cc")
+          s = p.read_text()
+          old = (
+              "    dispatch_data_t dispatch_data = dispatch_data_create(\n"
+              "        data, size, nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);\n"
+              "    MTL::Library* lib = device->newLibrary(dispatch_data, &error);\n"
+              "    dispatch_release(dispatch_data);\n"
+              "    if (!lib) {\n"
+              "      XELOGE(\"MetalTextureCache: failed to create texture_load library: {}\",\n"
+              "             error ? error->localizedDescription()->utf8String() : \"unknown\");\n"
+              "      return nullptr;\n"
+              "    }\n"
+          )
+          new = (
+              "    const char* msl_source = reinterpret_cast<const char*>(data);\n"
+              "    NS::String* ns_source =\n"
+              "        NS::String::string(msl_source, NS::UTF8StringEncoding);\n"
+              "    MTL::Library* lib = device->newLibrary(ns_source, nullptr, &error);\n"
+              "    if (!lib) {\n"
+              "      XELOGE(\"MetalTextureCache: failed to compile runtime texture_load MSL: {}\",\n"
+              "             error ? error->localizedDescription()->utf8String() : \"unknown\");\n"
+              "      return nullptr;\n"
+              "    }\n"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/ui/ios/shared/ios_view_helpers.mm")
+          s = p.read_text()
+          old = (
+              "UIVisualEffect* xe_make_chrome_visual_effect(BOOL clear_variant) {\n"
+              "  if (@available(iOS 26.0, *)) {\n"
+              "    UIGlassEffectStyle style =\n"
+              "        clear_variant ? UIGlassEffectStyleClear : UIGlassEffectStyleRegular;\n"
+              "    return [UIGlassEffect effectWithStyle:style];\n"
+              "  }\n"
+              "  // iOS 18-25 fallback: the closest pre-glass UIBlurEffect for each variant.\n"
+          )
+          new = (
+              "UIVisualEffect* xe_make_chrome_visual_effect(BOOL clear_variant) {\n"
+              "  // Legacy Xcode 15 build: UIGlassEffect is an iOS 26 SDK type and is not\n"
+              "  // declared by the iOS 17 SDK. iOS 16 uses this blur fallback anyway.\n"
+              "  // iOS 18-25 fallback: the closest pre-glass UIBlurEffect for each variant.\n"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Fetch XeniOS data repositories
+        working-directory: upstream
+        run: ./xenia-build.py fetchdata
+
+      - name: Verify legacy Metal compiler
+        run: |
+          xcrun --sdk iphoneos metal --version || true
+          echo 'kernel void xenios_probe(device uint* p [[buffer(0)]], uint i [[thread_position_in_grid]]) { p[i] = i; }' > /tmp/probe.metal
+          xcrun --sdk iphoneos metal -std=ios-metal2.3 -miphoneos-version-min=16.0 -c /tmp/probe.metal -o /tmp/probe.air
+          strings /tmp/probe.air | grep -E 'air64|apple-ios' | head -20 || true
+
+      - name: Build and package T14
+        working-directory: upstream
+        run: |
+          tools/build_apple_release.sh \
+            --out scratch/t14 \
+            --config release \
+            --version 2.0.1 \
+            --build-number 9849 \
+            --channel preview \
+            --stage stable \
+            --ios-min 16.0 \
+            --ios-bundle-id com.xenios.ios16.t14 \
+            --skip-macos-arm64 \
+            --skip-macos-x86_64 \
+            --skip-macos-universal
+
+      - name: Stamp T14 test name and re-sign
+        working-directory: upstream
+        run: |
+          IPA="scratch/t14/xenios_ios_iphone_ipad.ipa"
+          TMP="$(mktemp -d)"
+          ditto -x -k "$IPA" "$TMP"
+          APP="$(find "$TMP/Payload" -maxdepth 1 -name '*.app' -type d | head -n1)"
+          /usr/libexec/PlistBuddy -c "Delete :CFBundleDisplayName" "$APP/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string XeniOS iOS16 T14" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Delete :MinimumOSVersion" "$APP/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string 16.0" "$APP/Info.plist"
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -name '*.dylib' -type f -print0 | \
+              xargs -0 -I{} codesign --force --sign - --timestamp=none "{}"
+          fi
+          codesign --force --sign - --timestamp=none \
+            --entitlements xenia_ios.entitlements "$APP"
+          rm -f "$IPA"
+          (cd "$TMP" && zip -qry "$GITHUB_WORKSPACE/upstream/$IPA" Payload)
+          shasum -a 256 "$IPA"
+
+      - name: Inspect embedded Metal target strings
+        working-directory: upstream
+        run: |
+          IPA="scratch/t14/xenios_ios_iphone_ipad.ipa"
+          TMP="$(mktemp -d)"
+          ditto -x -k "$IPA" "$TMP"
+          APP="$(find "$TMP/Payload" -maxdepth 1 -name '*.app' -type d | head -n1)"
+          echo "Main executable:"
+          xcrun vtool -show-build "$APP/XeniOS"
+          echo "Metal AIR target strings:"
+          strings "$APP/XeniOS" | grep -E 'air64_v[0-9]+-apple-ios' | sort | uniq -c | head -50 || true
+
+      - name: Upload T14 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: XeniOS-iOS16-T14-runtime-metal
+          path: upstream/scratch/t14/xenios_ios_iphone_ipad.ipa
+          if-no-files-found: error
