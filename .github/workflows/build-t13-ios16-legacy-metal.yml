@@ -95,6 +95,25 @@ jobs:
           assert old in s
           p.write_text(s.replace(old, new, 1))
 
+          # Xcode 15 / iOS 17 SDK lacks newer PHASE automatic head-tracking
+          # APIs. iOS 16 uses the fixed-listener path, so compile that path only.
+          p = Path("src/xenia/apu/phase/phase_audio_driver.mm")
+          s = p.read_text()
+          old = (
+              "    if (cvars::apu_phase_head_tracking) {\n"
+              "      d->listener.automaticHeadTrackingFlags =\n"
+              "          PHASEAutomaticHeadTrackingFlagOrientation;\n"
+              "      XELOGI(\"PHASEAudioDriver: automatic head tracking ENABLED\");\n"
+              "    } else {\n"
+              "      XELOGI(\"PHASEAudioDriver: head tracking disabled (fixed listener)\");\n"
+              "    }\n"
+          )
+          new = (
+              "    XELOGI(\"PHASEAudioDriver: head tracking disabled (fixed listener)\");\n"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
           p = Path("src/xenia/ui/ios/shared/ios_view_helpers.mm")
           s = p.read_text()
           old = (
