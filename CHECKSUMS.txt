@@ -1,0 +1,25 @@
+# SHA-256 checksums
+
+Validated upstream IPA:
+ec277f6effa363d2b311ce5bdb0510b0e4630ea0b31aed08ad8a31eb42656336  xenios_ios_iphone_ipad.ipa
+
+Reference field-validated T9 IPA:
+5a16c29e4caa3808546dca83be665bd2a5eda8d0f760f7b3967689e359f7b5ff  XeniOS_2.0.1_iOS16_LAUNCH_TEST9.ipa
+
+Original main executable:
+7d000b31b96eee0174504f5c6292e9fa7dd55f423bdce4676a213fe04a67db4d  XeniOS (original)
+
+Patched T9 main executable:
+d14f6b5a65e19f5fd6cd0472708076c24f737bbaa28dc8db6dbb22169436fe4c  XeniOS (T9)
+
+Original libdxilconv.dylib:
+22dab0f75f713a71129bf089522ebccfaef0da307368328f39556870ccc406d9  libdxilconv.dylib (original)
+
+Patched libdxilconv.dylib:
+3eff622e17a47fa90ad06e5f63170927621dce13676f65ae9fa9bd02fa3cb362  libdxilconv.dylib (T9)
+
+Experimental T10 IPA:
+16b4a118a7e9d3839c77cb0bcec7d77e8c3b43281f915f38612182fc4bd90bf1  XeniOS_2.0.1_iOS16_LAUNCH_TEST10.ipa
+
+Experimental T10 main executable:
+68eb7008f2c036177c81b60decfe01f7ca33059012cf49404a2a7c8ffe827f7a  XeniOS (T10)
