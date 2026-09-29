@@ -396,6 +396,24 @@ jobs:
           assert old in s
           p.write_text(s.replace(old, new, 1))
 
+          # T36: preserve the Xing frame count when FFmpeg sees the in-memory
+          # asset as a concatenated MP3. This is the source equivalent of the
+          # field-validated T36 binary patch that improved PGR3 smoothness.
+          p = Path("third_party/FFmpeg/libavformat/mp3dec.c")
+          s = p.read_text()
+          old = (
+              "        if (fsize > mp3->header_filesize && delta > min >> 4) {\n"
+              "            mp3->frames = 0;\n"
+              "            av_log(s, AV_LOG_WARNING,\n"
+          )
+          new = (
+              "        if (fsize > mp3->header_filesize && delta > min >> 4) {\n"
+              "            /* iOS16 T36: preserve Xing frame count for in-memory assets. */\n"
+              "            av_log(s, AV_LOG_WARNING,\n"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
           # T48 diagnostics + source-level equivalents of the validated T38/T46
           # XMP behavior. Keep normal silent clients immediate, but pace only
           # independent XMP silent drivers at 131 ms per submitted block.
