@@ -1,4 +1,5 @@
 name: Build T48 iOS16 combined diagnostics
+# T48 trigger revision 2: combined renderer/audio diagnostics
 
 on:
   push:
