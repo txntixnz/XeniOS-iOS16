@@ -650,37 +650,38 @@ jobs:
           s = s.replace(old, new, 1)
 
           old = "namespace xe {\nnamespace gpu {\n"
-          new = """namespace xe {
-namespace gpu {
-
-namespace {
-std::atomic<uint64_t> t49_gpu_watch_exact_skips{0};
-std::atomic<uint64_t> t49_gpu_watch_last_log_ms{0};
-
-void T49RecordExactGpuWatchSkip() {
-  const uint64_t count =
-      t49_gpu_watch_exact_skips.fetch_add(1, std::memory_order_relaxed) + 1;
-  // Avoid a host clock query on every false page-sharing hit. During PGR3
-  // races this path may fire thousands of times per second.
-  if ((count & 255) != 0) {
-    return;
-  }
-  const uint64_t now_ms = Clock::QueryHostUptimeMillis();
-  uint64_t last_ms =
-      t49_gpu_watch_last_log_ms.load(std::memory_order_relaxed);
-  if (now_ms - last_ms < 1000) {
-    return;
-  }
-  if (!t49_gpu_watch_last_log_ms.compare_exchange_strong(
-          last_ms, now_ms, std::memory_order_relaxed)) {
-    return;
-  }
-  const uint64_t skips =
-      t49_gpu_watch_exact_skips.exchange(0, std::memory_order_relaxed);
-  XELOGI("[WATCH-DIAG] gpu_false_watch_checks_skipped_per_s={}", skips);
-}
-}  // namespace
-"""
+          new = (
+              "namespace xe {\n"
+              "namespace gpu {\n"
+              "\n"
+              "namespace {\n"
+              "std::atomic<uint64_t> t49_gpu_watch_exact_skips{0};\n"
+              "std::atomic<uint64_t> t49_gpu_watch_last_log_ms{0};\n"
+              "\n"
+              "void T49RecordExactGpuWatchSkip() {\n"
+              "  const uint64_t count =\n"
+              "      t49_gpu_watch_exact_skips.fetch_add(1, std::memory_order_relaxed) + 1;\n"
+              "  // Avoid a host clock query on every false page-sharing hit. During PGR3\n"
+              "  // races this path may fire thousands of times per second.\n"
+              "  if ((count & 255) != 0) {\n"
+              "    return;\n"
+              "  }\n"
+              "  const uint64_t now_ms = Clock::QueryHostUptimeMillis();\n"
+              "  uint64_t last_ms =\n"
+              "      t49_gpu_watch_last_log_ms.load(std::memory_order_relaxed);\n"
+              "  if (now_ms - last_ms < 1000) {\n"
+              "    return;\n"
+              "  }\n"
+              "  if (!t49_gpu_watch_last_log_ms.compare_exchange_strong(\n"
+              "          last_ms, now_ms, std::memory_order_relaxed)) {\n"
+              "    return;\n"
+              "  }\n"
+              "  const uint64_t skips =\n"
+              "      t49_gpu_watch_exact_skips.exchange(0, std::memory_order_relaxed);\n"
+              "  XELOGI(\"[WATCH-DIAG] gpu_false_watch_checks_skipped_per_s={}\", skips);\n"
+              "}\n"
+              "}  // namespace\n"
+          )
           assert old in s
           s = s.replace(old, new, 1)
 
