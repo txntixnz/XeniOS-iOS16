@@ -658,7 +658,13 @@ std::atomic<uint64_t> t49_gpu_watch_exact_skips{0};
 std::atomic<uint64_t> t49_gpu_watch_last_log_ms{0};
 
 void T49RecordExactGpuWatchSkip() {
-  t49_gpu_watch_exact_skips.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t count =
+      t49_gpu_watch_exact_skips.fetch_add(1, std::memory_order_relaxed) + 1;
+  // Avoid a host clock query on every false page-sharing hit. During PGR3
+  // races this path may fire thousands of times per second.
+  if ((count & 255) != 0) {
+    return;
+  }
   const uint64_t now_ms = Clock::QueryHostUptimeMillis();
   uint64_t last_ms =
       t49_gpu_watch_last_log_ms.load(std::memory_order_relaxed);
