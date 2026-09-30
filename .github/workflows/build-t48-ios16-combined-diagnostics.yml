@@ -404,11 +404,18 @@ jobs:
           # field-tested T36 NOP in _mp3_read_header.
           p = Path("third_party/FFmpeg/libavformat/mp3dec.c")
           s = p.read_text()
-          old = "    mp3->frames = 0;\n    mp3->header_filesize   = 0;"
+          old = (
+              "        if (fsize > mp3->header_filesize && delta > min >> 4) {\n"
+              "            mp3->frames = 0;\n"
+              "            av_log(s, AV_LOG_WARNING,\n"
+              "                   \"invalid concatenated file detected - using bitrate for duration\\n\");\n"
+          )
           new = (
-              "    // iOS16 T36: preserve an existing Xing frame count.\n"
-              "    // mp3->frames = 0;\n"
-              "    mp3->header_filesize   = 0;"
+              "        if (fsize > mp3->header_filesize && delta > min >> 4) {\n"
+              "            // iOS16 T36: preserve the Xing frame count here.\n"
+              "            // mp3->frames = 0;\n"
+              "            av_log(s, AV_LOG_WARNING,\n"
+              "                   \"invalid concatenated file detected - using bitrate for duration\\n\");\n"
           )
           assert old in s
           p.write_text(s.replace(old, new, 1))
