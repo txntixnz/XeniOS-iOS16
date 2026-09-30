@@ -13,6 +13,8 @@ on:
 permissions:
   contents: read
 
+# Trigger marker: T48 combined diagnostics workflow
+
 jobs:
   build-t48:
     runs-on: macos-14
