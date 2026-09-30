@@ -492,40 +492,39 @@ jobs:
           s = s.replace(old, new, 1)
 
           old = "namespace xe {\nnamespace apu {\n\nXmaContextNew::XmaContextNew() = default;"
-          new = """namespace xe {
-namespace apu {
-
-namespace {
-std::atomic<uint64_t> t48_xma_full_events{0};
-std::atomic<uint64_t> t48_xma_no_space_events{0};
-std::atomic<uint64_t> t48_xma_last_log_ms{0};
-
-void T48RecordXmaPressure(bool full, bool no_space) {
-  if (full) {
-    t48_xma_full_events.fetch_add(1, std::memory_order_relaxed);
-  }
-  if (no_space) {
-    t48_xma_no_space_events.fetch_add(1, std::memory_order_relaxed);
-  }
-  const uint64_t now_ms = Clock::QueryHostUptimeMillis();
-  uint64_t last_ms = t48_xma_last_log_ms.load(std::memory_order_relaxed);
-  if (now_ms - last_ms < 1000) {
-    return;
-  }
-  if (!t48_xma_last_log_ms.compare_exchange_strong(
-          last_ms, now_ms, std::memory_order_relaxed)) {
-    return;
-  }
-  const uint64_t full_count =
-      t48_xma_full_events.exchange(0, std::memory_order_relaxed);
-  const uint64_t no_space_count =
-      t48_xma_no_space_events.exchange(0, std::memory_order_relaxed);
-  XELOGI("[XMA-DIAG] full_per_s={} no_space_per_s={}", full_count,
-         no_space_count);
-}
-}  // namespace
-
-XmaContextNew::XmaContextNew() = default;"""
+          new = (
+              "namespace xe {\n"
+              "namespace apu {\n\n"
+              "namespace {\n"
+              "std::atomic<uint64_t> t48_xma_full_events{0};\n"
+              "std::atomic<uint64_t> t48_xma_no_space_events{0};\n"
+              "std::atomic<uint64_t> t48_xma_last_log_ms{0};\n\n"
+              "void T48RecordXmaPressure(bool full, bool no_space) {\n"
+              "  if (full) {\n"
+              "    t48_xma_full_events.fetch_add(1, std::memory_order_relaxed);\n"
+              "  }\n"
+              "  if (no_space) {\n"
+              "    t48_xma_no_space_events.fetch_add(1, std::memory_order_relaxed);\n"
+              "  }\n"
+              "  const uint64_t now_ms = Clock::QueryHostUptimeMillis();\n"
+              "  uint64_t last_ms = t48_xma_last_log_ms.load(std::memory_order_relaxed);\n"
+              "  if (now_ms - last_ms < 1000) {\n"
+              "    return;\n"
+              "  }\n"
+              "  if (!t48_xma_last_log_ms.compare_exchange_strong(\n"
+              "          last_ms, now_ms, std::memory_order_relaxed)) {\n"
+              "    return;\n"
+              "  }\n"
+              "  const uint64_t full_count =\n"
+              "      t48_xma_full_events.exchange(0, std::memory_order_relaxed);\n"
+              "  const uint64_t no_space_count =\n"
+              "      t48_xma_no_space_events.exchange(0, std::memory_order_relaxed);\n"
+              "  XELOGI(\"[XMA-DIAG] full_per_s={} no_space_per_s={}\", full_count,\n"
+              "         no_space_count);\n"
+              "}\n"
+              "}  // namespace\n\n"
+              "XmaContextNew::XmaContextNew() = default;"
+          )
           assert old in s
           s = s.replace(old, new, 1)
 
