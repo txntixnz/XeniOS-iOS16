@@ -2,6 +2,9 @@ name: Build T51 iOS16 title-render flag probe
 # Manual-only one-variable XMP control-semantics probe based on T48R.
 
 on:
+  push:
+    paths:
+      - ".github/workflows/build-t51-ios16-title-render-flag.yml"
   workflow_dispatch:
 
 permissions:
