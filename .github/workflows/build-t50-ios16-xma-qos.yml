@@ -2,6 +2,9 @@ name: Build T50 iOS16 XMA QoS probe
 # Manual-only one-variable probe based on successful T48.
 
 on:
+  push:
+    paths:
+      - ".github/workflows/build-t50-ios16-xma-qos.yml"
   workflow_dispatch:
 
 permissions:
