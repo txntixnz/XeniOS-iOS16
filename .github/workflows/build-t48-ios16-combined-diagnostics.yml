@@ -1,4 +1,4 @@
-name: Build T48 iOS16 combined diagnostics
+name: Build T48R iOS16 low-overhead diagnostics
 # T48 trigger revision 2: combined renderer/audio diagnostics
 # PR-run marker: used only to expose the Actions run to ChatGPT tooling
 
@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 jobs:
-  build-t48:
+  build-t48r:
     runs-on: macos-14
     timeout-minutes: 150
     steps:
@@ -505,6 +505,7 @@ jobs:
               "namespace {\n"
               "std::atomic<uint64_t> t48_xma_full_events{0};\n"
               "std::atomic<uint64_t> t48_xma_no_space_events{0};\n"
+              "std::atomic<uint64_t> t48_xma_probe_events{0};\n"
               "std::atomic<uint64_t> t48_xma_last_log_ms{0};\n\n"
               "void T48RecordXmaPressure(bool full, bool no_space) {\n"
               "  if (full) {\n"
@@ -512,6 +513,11 @@ jobs:
               "  }\n"
               "  if (no_space) {\n"
               "    t48_xma_no_space_events.fetch_add(1, std::memory_order_relaxed);\n"
+              "  }\n"
+              "  const uint64_t probe_count =\n"
+              "      t48_xma_probe_events.fetch_add(1, std::memory_order_relaxed) + 1;\n"
+              "  if ((probe_count & UINT64_C(255)) != 0) {\n"
+              "    return;\n"
               "  }\n"
               "  const uint64_t now_ms = Clock::QueryHostUptimeMillis();\n"
               "  uint64_t last_ms = t48_xma_last_log_ms.load(std::memory_order_relaxed);\n"
@@ -616,33 +622,33 @@ jobs:
           xcrun --sdk iphoneos metal -std=ios-metal2.3 -miphoneos-version-min=16.0 -c /tmp/probe.metal -o /tmp/probe.air
           strings /tmp/probe.air | grep -E 'air64|apple-ios' | head -20 || true
 
-      - name: Build and package T48
+      - name: Build and package T48R
         working-directory: upstream
         run: |
           tools/build_apple_release.sh \
-            --out scratch/t48 \
+            --out scratch/t48r \
             --config release \
             --version 2.0.1 \
             --build-number 9849 \
             --channel preview \
             --stage stable \
             --ios-min 16.0 \
-            --ios-bundle-id com.xenios.ios16.t48diag \
+            --ios-bundle-id com.xenios.ios16.t48rdiag \
             --skip-macos-arm64 \
             --skip-macos-x86_64 \
             --skip-macos-universal
 
-      - name: Stamp T48 test name and re-sign
+      - name: Stamp T48R test name and re-sign
         working-directory: upstream
         run: |
-          IPA="scratch/t48/xenios_ios_iphone_ipad.ipa"
+          IPA="scratch/t48r/xenios_ios_iphone_ipad.ipa"
           TMP="$(mktemp -d)"
           ditto -x -k "$IPA" "$TMP"
           APP="$(find "$TMP/Payload" -maxdepth 1 -name '*.app' -type d | head -n1)"
           /usr/libexec/PlistBuddy -c "Delete :CFBundleDisplayName" "$APP/Info.plist" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string XeniOS iOS16 T48" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string XeniOS iOS16 T48R" "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c "Delete :CFBundleVersion" "$APP/Info.plist" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 9849.48" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 9849.481" "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c "Delete :MinimumOSVersion" "$APP/Info.plist" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string 16.0" "$APP/Info.plist"
           if [ -d "$APP/Frameworks" ]; then
@@ -658,7 +664,7 @@ jobs:
       - name: Inspect embedded Metal target strings
         working-directory: upstream
         run: |
-          IPA="scratch/t48/xenios_ios_iphone_ipad.ipa"
+          IPA="scratch/t48r/xenios_ios_iphone_ipad.ipa"
           TMP="$(mktemp -d)"
           ditto -x -k "$IPA" "$TMP"
           APP="$(find "$TMP/Payload" -maxdepth 1 -name '*.app' -type d | head -n1)"
@@ -667,9 +673,9 @@ jobs:
           echo "Metal AIR target strings:"
           strings "$APP/XeniOS" | grep -E 'air64_v[0-9]+-apple-ios' | sort | uniq -c | head -50 || true
 
-      - name: Upload T48 IPA
+      - name: Upload T48R IPA
         uses: actions/upload-artifact@v4
         with:
-          name: XeniOS-iOS16-T48-combined-diagnostics
-          path: upstream/scratch/t48/xenios_ios_iphone_ipad.ipa
+          name: XeniOS-iOS16-T48R-low-overhead-diagnostics
+          path: upstream/scratch/t48r/xenios_ios_iphone_ipad.ipa
           if-no-files-found: error
