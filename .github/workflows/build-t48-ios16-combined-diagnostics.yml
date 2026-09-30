@@ -5,6 +5,9 @@ on:
   push:
     paths:
       - ".github/workflows/build-t48-ios16-combined-diagnostics.yml"
+  pull_request:
+    paths:
+      - ".github/workflows/build-t48-ios16-combined-diagnostics.yml"
   workflow_dispatch:
 
 permissions:
