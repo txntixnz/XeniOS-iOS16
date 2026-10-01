@@ -1,0 +1,700 @@
+name: Build T52 iOS16 PHASE playback pacing
+# T48 trigger revision 2: combined renderer/audio diagnostics
+# PR-run marker: used only to expose the Actions run to ChatGPT tooling
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-t52-ios16-phase-playback-pacing.yml"
+  pull_request:
+    paths:
+      - ".github/workflows/build-t48-ios16-combined-diagnostics.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-t52:
+    runs-on: macos-14
+    timeout-minutes: 150
+    steps:
+      - name: Checkout backport repo
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 15.0.1
+        run: |
+          sudo xcode-select -s /Applications/Xcode_15.0.1.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Checkout exact upstream XeniOS build 9849 source
+        run: |
+          git clone https://github.com/xenios-jp/XeniOS.git upstream
+          cd upstream
+          git checkout acfa2878a
+          git submodule update --init --depth=1 -j$(sysctl -n hw.ncpu) \
+            $(grep -oE 'path = .+' .gitmodules | sed 's/path = //')
+          git -C third_party/DirectXShaderCompiler submodule update --init --depth=1 \
+            external/SPIRV-Headers external/SPIRV-Tools
+          git submodule update --init --recursive --depth=1 \
+            -j$(sysctl -n hw.ncpu) third_party/wxWidgets
+
+      - name: Apply iOS 16 source backport
+        working-directory: upstream
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("CMakeLists.txt")
+          s = p.read_text()
+          old = 'set(CMAKE_OSX_DEPLOYMENT_TARGET "18.0" CACHE STRING "Minimum iOS version")'
+          new = 'set(CMAKE_OSX_DEPLOYMENT_TARGET "16.0" CACHE STRING "Minimum iOS version")'
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/base/logging.cc")
+          s = p.read_text()
+          old = "#if XE_PLATFORM_ANDROID\n  // Throw an error that can be reported to the developers via the store.\n  std::abort();"
+          new = "#if XE_PLATFORM_ANDROID || XE_PLATFORM_IOS\n  // iOS 16 has no quick_exit; abort also preserves a useful crash report.\n  std::abort();"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/base/memory_posix.cc")
+          s = p.read_text()
+          old = "  std::atexit(CleanupAtExit);\n  std::at_quick_exit(CleanupAtExit);"
+          new = "  std::atexit(CleanupAtExit);\n#if !XE_PLATFORM_IOS\n  std::at_quick_exit(CleanupAtExit);\n#endif"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/app/xenia_main.cc")
+          s = p.read_text()
+          old = "  xe::FlushLog();\n  std::quick_exit(EXIT_SUCCESS);"
+          new = "  xe::FlushLog();\n#if XE_PLATFORM_IOS\n  std::_Exit(EXIT_SUCCESS);\n#else\n  std::quick_exit(EXIT_SUCCESS);\n#endif"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/base/clock.cc")
+          s = p.read_text()
+          old = "DEFINE_bool(clock_no_scaling, false,"
+          new = "DEFINE_bool(clock_no_scaling, true,"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/gpu/gpu_flags.cc")
+          s = p.read_text()
+          old = 'metal_residency_sets, "auto",'
+          new = 'metal_residency_sets, "false",'
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # Xcode 15 / iOS 17 SDK cannot parse the iOS 26 UIGlassEffect types
+          # even though the code is guarded with @available. Compile the same
+          # pre-glass fallback path directly for this legacy-toolchain build.
+          # Older Clang rejects static_cast<uint32_t -> union AttributeKey>.
+          # This is byte-for-byte equivalent to the constructors below it.
+          p = Path("src/xenia/kernel/xam/user_property.cc")
+          s = p.read_text()
+          old = "  property_id_ = static_cast<AttributeKey>(property_id);"
+          new = "  property_id_.value = property_id;"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # Xcode 15 / iOS 17 SDK lacks newer PHASE automatic head-tracking
+          # APIs. iOS 16 uses the fixed-listener path, so compile that path only.
+          p = Path("src/xenia/apu/phase/phase_audio_driver.mm")
+          s = p.read_text()
+          old = (
+              "    if (cvars::apu_phase_head_tracking) {\n"
+              "      d->listener.automaticHeadTrackingFlags =\n"
+              "          PHASEAutomaticHeadTrackingFlagOrientation;\n"
+              "      XELOGI(\"PHASEAudioDriver: automatic head tracking ENABLED\");\n"
+              "    } else {\n"
+              "      XELOGI(\"PHASEAudioDriver: head tracking disabled (fixed listener)\");\n"
+              "    }\n"
+          )
+          new = (
+              "    XELOGI(\"PHASEAudioDriver: head tracking disabled (fixed listener)\");\n"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # T15: For texture_load shaders, emit preprocessed MSL source
+          # bytes (NUL-terminated) instead of an offline metallib. iOS 16 will
+          # compile this source with its own Metal runtime, avoiding newer
+          # metallib container/IR compatibility problems.
+          p = Path("tools/build/shader_cc.cc")
+          s = p.read_text()
+          old = (
+              "    auto lib_path = tmp_dir / (tag + \".metallib\");\n\n"
+              "    auto cleanup = [&] {\n"
+              "      std::error_code ec;\n"
+              "      std::filesystem::remove(air_path, ec);\n"
+              "      std::filesystem::remove(lib_path, ec);\n"
+              "    };\n"
+          )
+          new = (
+              "    auto lib_path = tmp_dir / (tag + \".metallib\");\n"
+              "    auto source_path = tmp_dir / (tag + \".metal\");\n\n"
+              "    auto cleanup = [&] {\n"
+              "      std::error_code ec;\n"
+              "      std::filesystem::remove(air_path, ec);\n"
+              "      std::filesystem::remove(lib_path, ec);\n"
+              "      std::filesystem::remove(source_path, ec);\n"
+              "    };\n"
+          )
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = (
+              "    if (RunCommand({\"xcrun\", \"-sdk\", metal_sdk, \"metallib\", air_path.string(),\n"
+              "                    \"-o\", lib_path.string()}) != 0) {\n"
+          )
+          inject = (
+              "    const bool runtime_source =\n"
+              "        identifier.rfind(\"texture_load_\", 0) == 0 ||\n"
+              "        identifier == \"texture_upload_repack\" ||\n"
+              "        identifier.rfind(\"resolve_host_\", 0) == 0;\n"
+              "    if (runtime_source) {\n"
+              "      std::vector<std::string> pp_cmd = {\n"
+              "          \"xcrun\", \"-sdk\", metal_sdk, \"metal\", \"-x\", \"metal\",\n"
+              "          \"-std=\" + metal_std, metal_min_version_flag, \"-D\",\n"
+              "          \"SHADING_LANGUAGE_MSL_XE=1\", \"-w\"};\n"
+              "      AppendDefines(&pp_cmd, defines, \"-D\");\n"
+              "      if (!input_dir.empty()) {\n"
+              "        pp_cmd.push_back(\"-I\");\n"
+              "        pp_cmd.push_back(input_dir);\n"
+              "      }\n"
+              "      pp_cmd.push_back(\"-E\");\n"
+              "      pp_cmd.push_back(input_path.string());\n"
+              "      pp_cmd.push_back(\"-o\");\n"
+              "      pp_cmd.push_back(source_path.string());\n"
+              "      if (RunCommand(pp_cmd) != 0) {\n"
+              "        std::fprintf(stderr, \"metal preprocess failed for %s\\n\",\n"
+              "                     input_path.string().c_str());\n"
+              "        cleanup();\n"
+              "        return 1;\n"
+              "      }\n"
+              "      std::vector<uint8_t> source_bytes;\n"
+              "      if (!ReadBinaryFile(source_path, &source_bytes)) {\n"
+              "        cleanup();\n"
+              "        return 1;\n"
+              "      }\n"
+              "      std::string runtime_msl(reinterpret_cast<const char*>(source_bytes.data()),\n"
+              "                              source_bytes.size());\n"
+              "      auto erase_line_containing = [&](std::string_view marker) {\n"
+              "        size_t pos = 0;\n"
+              "        while ((pos = runtime_msl.find(marker, pos)) != std::string::npos) {\n"
+              "          size_t begin = runtime_msl.rfind('\\n', pos);\n"
+              "          begin = begin == std::string::npos ? 0 : begin + 1;\n"
+              "          size_t end = runtime_msl.find('\\n', pos);\n"
+              "          if (end == std::string::npos) end = runtime_msl.size();\n"
+              "          else ++end;\n"
+              "          runtime_msl.erase(begin, end - begin);\n"
+              "          pos = begin;\n"
+              "        }\n"
+              "      };\n"
+              "      erase_line_containing(\"#pragma clang module import metal_types\");\n"
+              "      erase_line_containing(\"#pragma clang module import metal_stdlib\");\n"
+              "      runtime_msl.insert(0, \"#include <metal_stdlib>\\n\");\n"
+              "      source_bytes.assign(runtime_msl.begin(), runtime_msl.end());\n"
+              "      source_bytes.push_back(0);\n"
+              "      cleanup();\n"
+              "      return WriteMetallibHeader(output_path, identifier, source_bytes) ? 0 : 1;\n"
+              "    }\n\n"
+          )
+          assert old in s
+          s = s.replace(old, inject + old, 1)
+          p.write_text(s)
+
+          # T15 texture cache: the generated texture_load_*_metallib arrays
+          # contain NUL-terminated preprocessed MSL source. Compile them on the
+          # device with its native Metal compiler.
+          p = Path("src/xenia/gpu/metal/metal_texture_cache.cc")
+          s = p.read_text()
+          old = (
+              "    dispatch_data_t dispatch_data = dispatch_data_create(\n"
+              "        data, size, nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);\n"
+              "    MTL::Library* lib = device->newLibrary(dispatch_data, &error);\n"
+              "    dispatch_release(dispatch_data);\n"
+              "    if (!lib) {\n"
+              "      XELOGE(\"MetalTextureCache: failed to create texture_load library: {}\",\n"
+              "             error ? error->localizedDescription()->utf8String() : \"unknown\");\n"
+              "      return nullptr;\n"
+              "    }\n"
+          )
+          new = (
+              "    static uint32_t runtime_msl_sequence = 0;\n"
+              "    const uint32_t runtime_msl_id = runtime_msl_sequence++;\n"
+              "    const char* msl_source = reinterpret_cast<const char*>(data);\n"
+              "    NS::String* ns_source =\n"
+              "        NS::String::string(msl_source, NS::UTF8StringEncoding);\n"
+              "    MTL::CompileOptions* compile_options =\n"
+              "        MTL::CompileOptions::alloc()->init();\n"
+              "    compile_options->setFastMathEnabled(true);\n"
+              "    compile_options->setLanguageVersion(MTL::LanguageVersion2_4);\n"
+              "    MTL::Library* lib =\n"
+              "        device->newLibrary(ns_source, compile_options, &error);\n"
+              "    compile_options->release();\n"
+              "    if (!lib) {\n"
+              "      XELOGE(\"MetalTextureCache: runtime MSL #{} ({} bytes) compile failed: {}\",\n"
+              "             runtime_msl_id, size,\n"
+              "             error ? error->localizedDescription()->utf8String() : \"unknown\");\n"
+              "      return nullptr;\n"
+              "    }\n"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # T34: Source equivalents of the field-validated T23-T33 renderer
+          # changes, plus the iOS 16 runtime direct-host resolve path.
+          p = Path("src/xenia/gpu/metal/metal_pipeline_cache.cc")
+          s = p.read_text()
+          old = "DEFINE_bool(metal_native_msl_render, false,"
+          new = "DEFINE_bool(metal_native_msl_render, true,"
+          assert old in s
+          s = s.replace(old, new, 1)
+          old = "DEFINE_bool(metal_native_msl_helper_msc, true,"
+          new = "DEFINE_bool(metal_native_msl_helper_msc, false,"
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          # T33: iOS 16 Metal aborts while serializing MTLBinaryArchive during
+          # title teardown. Skip only the shutdown serialization call.
+          old = (
+              "        if (!pipeline_binary_archive_->serializeToURL(url, &error)) {\n"
+              "          if (error) {\n"
+              "            XELOGW(\"Metal binary archive serialize failed: {}\",\n"
+              "                   error->localizedDescription()->utf8String());\n"
+              "          }\n"
+              "        }\n"
+          )
+          new = (
+              "        // iOS 16 backport: skip shutdown MTLBinaryArchive serialization.\n"
+              "        (void)url;\n"
+              "        (void)error;\n"
+          )
+          assert old in s
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          # T26: only use compile options known to exist on iOS 16.
+          p = Path("src/xenia/gpu/metal/metal_shader.cc")
+          s = p.read_text()
+          old = (
+              "  MTL::CompileOptions* compile_options = nullptr;\n"
+              "  if (cvars::metal_native_msl_debug_validation ||\n"
+              "      !cvars::metal_native_msl_fast_math) {\n"
+              "    compile_options = MTL::CompileOptions::alloc()->init();\n"
+              "    compile_options->setMathMode(MTL::MathModeSafe);\n"
+              "    compile_options->setMathFloatingPointFunctions(\n"
+              "        MTL::MathFloatingPointFunctionsFast);\n"
+              "    if (cvars::metal_native_msl_debug_validation) {\n"
+              "      compile_options->setEnableLogging(true);\n"
+              "      compile_options->setPreserveInvariance(true);\n"
+              "    }\n"
+              "    compile_options->setOptimizationLevel(MTL::LibraryOptimizationLevelDefault);\n"
+              "  }\n"
+          )
+          new = (
+              "  MTL::CompileOptions* compile_options =\n"
+              "      MTL::CompileOptions::alloc()->init();\n"
+              "  compile_options->setFastMathEnabled(true);\n"
+              "  compile_options->setLanguageVersion(MTL::LanguageVersion2_4);\n"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # T27: avoid Metal mesh shaders. Use native MSL point/rectangle VS
+          # expansion and PrimitiveProcessor quad-to-triangle conversion.
+          p = Path("src/xenia/gpu/metal/metal_primitive_processor.cc")
+          s = p.read_text()
+          old = (
+              "  const bool native_msl_mesh_primitive_lists =\n"
+              "      native_msl_render && command_processor_.IsMeshShaderSupported();\n"
+              "  const bool native_msl_expand_rectangle_lists =\n"
+              "      native_msl_render && cvars::metal_native_msl_expand_rectangle_lists;\n"
+          )
+          new = (
+              "  const bool native_msl_mesh_primitive_lists = false;\n"
+              "  const bool native_msl_expand_rectangle_lists = native_msl_render;\n"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/gpu/metal/metal_command_processor.cc")
+          s = p.read_text()
+          old = (
+              "  const bool native_primitive_mesh_supported =\n"
+              "      ::cvars::metal_native_msl_render && mesh_shader_supported_ &&\n"
+              "      !primitive_processing_result.IsTessellated();\n"
+          )
+          new = "  const bool native_primitive_mesh_supported = false;\n"
+          assert old in s
+          s = s.replace(old, new, 1)
+          old = (
+              "    const bool keep_native_msl_vs_expansion =\n"
+              "        host_point_list_as_triangle_strip && ::cvars::metal_native_msl_render;\n"
+          )
+          new = (
+              "    const bool keep_native_msl_vs_expansion =\n"
+              "        ::cvars::metal_native_msl_render;\n"
+          )
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          # T30/T32: selector is unavailable on the iOS 16 Metal runtime.
+          old = (
+              "        cache_desc->setVisibilityResultType(\n"
+              "            MTL::VisibilityResultTypeAccumulate);\n"
+          )
+          new = (
+              "        // iOS 16 backport: visibilityResultType is unavailable.\n"
+          )
+          assert old in s
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          # T34: generated resolve_host_* arrays contain preprocessed,
+          # NUL-terminated MSL. Compile them with the device's iOS 16 Metal
+          # runtime instead of loading incompatible offline metallibs.
+          p = Path("src/xenia/gpu/metal/metal_direct_host_resolve.cc")
+          s = p.read_text()
+          old = (
+              "  dispatch_data_t data = dispatch_data_create(\n"
+              "      metallib_data, metallib_size, nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);\n"
+              "  MTL::Library* lib = device->newLibrary(data, &error);\n"
+              "  dispatch_release(data);\n"
+          )
+          new = (
+              "  const char* msl_source = reinterpret_cast<const char*>(metallib_data);\n"
+              "  NS::String* ns_source =\n"
+              "      NS::String::string(msl_source, NS::UTF8StringEncoding);\n"
+              "  MTL::CompileOptions* compile_options =\n"
+              "      MTL::CompileOptions::alloc()->init();\n"
+              "  compile_options->setFastMathEnabled(true);\n"
+              "  compile_options->setLanguageVersion(MTL::LanguageVersion2_4);\n"
+              "  MTL::Library* lib =\n"
+              "      device->newLibrary(ns_source, compile_options, &error);\n"
+              "  compile_options->release();\n"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/xenia/ui/ios/shared/ios_view_helpers.mm")
+          s = p.read_text()
+          old = (
+              "UIVisualEffect* xe_make_chrome_visual_effect(BOOL clear_variant) {\n"
+              "  if (@available(iOS 26.0, *)) {\n"
+              "    UIGlassEffectStyle style =\n"
+              "        clear_variant ? UIGlassEffectStyleClear : UIGlassEffectStyleRegular;\n"
+              "    return [UIGlassEffect effectWithStyle:style];\n"
+              "  }\n"
+              "  // iOS 18-25 fallback: the closest pre-glass UIBlurEffect for each variant.\n"
+          )
+          new = (
+              "UIVisualEffect* xe_make_chrome_visual_effect(BOOL clear_variant) {\n"
+              "  // Legacy Xcode 15 build: UIGlassEffect is an iOS 26 SDK type and is not\n"
+              "  // declared by the iOS 17 SDK. iOS 16 uses this blur fallback anyway.\n"
+              "  // iOS 18-25 fallback: the closest pre-glass UIBlurEffect for each variant.\n"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+          # T36: Preserve an existing Xing frame count instead of clearing it
+          # before VBR tag parsing. This is the source-level equivalent of the
+          # field-tested T36 NOP in _mp3_read_header.
+          p = Path("third_party/FFmpeg/libavformat/mp3dec.c")
+          s = p.read_text()
+          old = (
+              "        if (fsize > mp3->header_filesize && delta > min >> 4) {\n"
+              "            mp3->frames = 0;\n"
+              "            av_log(s, AV_LOG_WARNING,\n"
+              "                   \"invalid concatenated file detected - using bitrate for duration\\n\");\n"
+          )
+          new = (
+              "        if (fsize > mp3->header_filesize && delta > min >> 4) {\n"
+              "            // iOS16 T36: preserve the Xing frame count here.\n"
+              "            // mp3->frames = 0;\n"
+              "            av_log(s, AV_LOG_WARNING,\n"
+              "                   \"invalid concatenated file detected - using bitrate for duration\\n\");\n"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # T38: Don't auto-advance the XMP playlist merely because FFmpeg
+          # reaches EOF. PGR3 reacts badly when this happens prematurely.
+          p = Path("src/xenia/apu/audio_media_player.cc")
+          s = p.read_text()
+          old = (
+              "  if (!IsLastSongInPlaylist()) {\n"
+              "    Next();\n"
+              "    return;\n"
+              "  }\n"
+          )
+          new = (
+              "  if (!IsLastSongInPlaylist()) {\n"
+              "    XELOGI(\"[XMP-DIAG] auto_next suppressed current_song={}\", "
+              "current_song_handle_);\n"
+              "    return;\n"
+              "  }\n"
+          )
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = (
+              "  auto result =\n"
+              "      ProcessAudioLoop(this, driver_.get(), formatContext, codecContext, 0);\n"
+          )
+          new = (
+              "  auto result =\n"
+              "      ProcessAudioLoop(this, driver_.get(), formatContext, codecContext, 0);\n"
+              "  XELOGI(\"[XMP-DIAG] decode_end result={} song_handle={}\",\n"
+              "         static_cast<int>(result), current_song_handle_);\n"
+          )
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = "X_STATUS AudioMediaPlayer::Next() {\n  if (!active_playlist_) {"
+          new = (
+              "X_STATUS AudioMediaPlayer::Next() {\n"
+              "  XELOGI(\"[XMP-DIAG] guest_next current_song={} active={}\",\n"
+              "         current_song_handle_, active_song_ ? active_song_->handle : 0);\n"
+              "  if (!active_playlist_) {"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # T46: Pace SilentAudioDriver at 131.072 ms before releasing its
+          # semaphore. This preserves the stable anti-cycling behavior measured
+          # on-device while keeping PHASE itself untouched.
+          p = Path("src/xenia/apu/silent_audio_driver.h")
+          s = p.read_text()
+          old = (
+              "    if (semaphore_) {\n"
+              "      semaphore_->Release(1, nullptr);\n"
+              "    }\n"
+          )
+          new = (
+              "    if (semaphore_) {\n"
+              "      xe::threading::Sleep(std::chrono::microseconds(131072));\n"
+              "      semaphore_->Release(1, nullptr);\n"
+              "    }\n"
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # T48 lightweight XMA pressure indicator. Info-level output survives
+          # when the user runs normal Info logging, while the existing
+          # per-context Debug/APU spam can be disabled.
+          p = Path("src/xenia/apu/xma_context_new.cc")
+          s = p.read_text()
+          old = '#include "xenia/apu/xma_helpers.h"\n\n#include "xenia/base/logging.h"'
+          new = (
+              '#include "xenia/apu/xma_helpers.h"\n\n'
+              '#include <atomic>\n\n'
+              '#include "xenia/base/clock.h"\n'
+              '#include "xenia/base/logging.h"'
+          )
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = "namespace xe {\nnamespace apu {\n\nXmaContextNew::XmaContextNew() = default;"
+          new = (
+              "namespace xe {\n"
+              "namespace apu {\n\n"
+              "namespace {\n"
+              "std::atomic<uint64_t> t48_xma_full_events{0};\n"
+              "std::atomic<uint64_t> t48_xma_no_space_events{0};\n"
+              "std::atomic<uint64_t> t48_xma_probe_events{0};\n"
+              "std::atomic<uint64_t> t48_xma_last_log_ms{0};\n\n"
+              "void T48RecordXmaPressure(bool full, bool no_space) {\n"
+              "  if (full) {\n"
+              "    t48_xma_full_events.fetch_add(1, std::memory_order_relaxed);\n"
+              "  }\n"
+              "  if (no_space) {\n"
+              "    t48_xma_no_space_events.fetch_add(1, std::memory_order_relaxed);\n"
+              "  }\n"
+              "  const uint64_t probe_count =\n"
+              "      t48_xma_probe_events.fetch_add(1, std::memory_order_relaxed) + 1;\n"
+              "  if ((probe_count & UINT64_C(255)) != 0) {\n"
+              "    return;\n"
+              "  }\n"
+              "  const uint64_t now_ms = Clock::QueryHostUptimeMillis();\n"
+              "  uint64_t last_ms = t48_xma_last_log_ms.load(std::memory_order_relaxed);\n"
+              "  if (now_ms - last_ms < 1000) {\n"
+              "    return;\n"
+              "  }\n"
+              "  if (!t48_xma_last_log_ms.compare_exchange_strong(\n"
+              "          last_ms, now_ms, std::memory_order_relaxed)) {\n"
+              "    return;\n"
+              "  }\n"
+              "  const uint64_t full_count =\n"
+              "      t48_xma_full_events.exchange(0, std::memory_order_relaxed);\n"
+              "  const uint64_t no_space_count =\n"
+              "      t48_xma_no_space_events.exchange(0, std::memory_order_relaxed);\n"
+              "  XELOGI(\"[XMA-DIAG] full_per_s={} no_space_per_s={}\", full_count,\n"
+              "         no_space_count);\n"
+              "}\n"
+              "}  // namespace\n\n"
+              "XmaContextNew::XmaContextNew() = default;"
+          )
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = (
+              "  if (minimum_subframe_decode_count >\n"
+              "      remaining_subframe_blocks_in_output_buffer_) {\n"
+              "    XELOGD(\"XmaContext {}: No space for subframe decoding {}/{}!\", id(),"
+          )
+          new = (
+              "  if (minimum_subframe_decode_count >\n"
+              "      remaining_subframe_blocks_in_output_buffer_) {\n"
+              "    T48RecordXmaPressure(false, true);\n"
+              "    XELOGD(\"XmaContext {}: No space for subframe decoding {}/{}!\", id(),"
+          )
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = (
+              "  if (remaining_subframe_blocks_in_output_buffer_ == 0 && output_rb.empty()) {\n"
+              "    XELOGAPU(\"XmaContext {}: Output ring buffer is full, invalidating output\","
+          )
+          new = (
+              "  if (remaining_subframe_blocks_in_output_buffer_ == 0 && output_rb.empty()) {\n"
+              "    T48RecordXmaPressure(true, false);\n"
+              "    XELOGAPU(\"XmaContext {}: Output ring buffer is full, invalidating output\","
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # T48 actual host swap-rate indicator. This is a measured FPS-like
+          # value from Metal IssueSwap cadence, not an estimate from log size.
+          p = Path("src/xenia/gpu/metal/metal_command_processor.cc")
+          s = p.read_text()
+          old = '#include "xenia/base/cvar.h"\n#include "xenia/base/logging.h"'
+          new = (
+              '#include "xenia/base/cvar.h"\n'
+              '#include "xenia/base/clock.h"\n'
+              '#include "xenia/base/logging.h"'
+          )
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = (
+              '  MaybeDumpBackendTelemetry("swap");\n'
+              '}\n\n'
+              'void MetalCommandProcessor::OnPrimaryBufferEnd() {'
+          )
+          new = (
+              '  {\n'
+              '    static uint64_t t48_swaps = 0;\n'
+              '    static auto t48_last = std::chrono::steady_clock::now();\n'
+              '    ++t48_swaps;\n'
+              '    const auto now = std::chrono::steady_clock::now();\n'
+              '    const double elapsed =\n'
+              '        std::chrono::duration<double>(now - t48_last).count();\n'
+              '    if (elapsed >= 1.0) {\n'
+              '      XELOGI(\"[PERF-DIAG] host_fps={:.2f} swaps={} scalar={:.3f} refresh_cap={} limit={}\",\n'
+              '             static_cast<double>(t48_swaps) / elapsed, t48_swaps,\n'
+              '             Clock::guest_time_scalar(), cvars::guest_display_refresh_cap,\n'
+              '             cvars::framerate_limit);\n'
+              '      t48_swaps = 0;\n'
+              '      t48_last = now;\n'
+              '    }\n'
+              '  }\n'
+              '  MaybeDumpBackendTelemetry("swap");\n'
+              '}\n\n'
+              'void MetalCommandProcessor::OnPrimaryBufferEnd() {'
+          )
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+
+          # T52 single-variable test for PHASE PCM producer/consumer clock
+          # divergence: play 48000-Hz guest PCM at 47520 Hz (-1.0%), so
+          # PHASE consumes slightly slower and its queue can recover.
+          # Preserve guest PCM, game state, XMA, and rendering untouched.
+          p = Path("src/xenia/apu/phase/phase_audio_driver.mm")
+          s = p.read_text()
+          old = "                 sampleRate:static_cast<double>(d->frequency)\n"
+          new = "                 sampleRate:static_cast<double>(d->frequency) * 0.99\n"
+          assert s.count(old) == 1
+          s = s.replace(old, new, 1)
+          old = "    d->format = [[AVAudioFormat alloc]\n"
+          new = (
+              "    XELOGI(\"[AUDIO-PACE] guest_hz={} phase_hz={} factor=0.99\",\n"
+              "           d->frequency, static_cast<double>(d->frequency) * 0.99);\n"
+              "    d->format = [[AVAudioFormat alloc]\n"
+          )
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new, 1))
+
+          PY
+
+      - name: Fetch XeniOS data repositories
+        working-directory: upstream
+        run: ./xenia-build.py fetchdata
+
+      - name: Verify legacy Metal compiler
+        run: |
+          xcrun --sdk iphoneos metal --version || true
+          echo 'kernel void xenios_probe(device uint* p [[buffer(0)]], uint i [[thread_position_in_grid]]) { p[i] = i; }' > /tmp/probe.metal
+          xcrun --sdk iphoneos metal -std=ios-metal2.3 -miphoneos-version-min=16.0 -c /tmp/probe.metal -o /tmp/probe.air
+          strings /tmp/probe.air | grep -E 'air64|apple-ios' | head -20 || true
+
+      - name: Build and package T52
+        working-directory: upstream
+        run: |
+          tools/build_apple_release.sh \
+            --out scratch/t52 \
+            --config release \
+            --version 2.0.1 \
+            --build-number 9849 \
+            --channel preview \
+            --stage stable \
+            --ios-min 16.0 \
+            --ios-bundle-id com.xenios.ios16.t52audiopace \
+            --skip-macos-arm64 \
+            --skip-macos-x86_64 \
+            --skip-macos-universal
+
+      - name: Stamp T52 test name and re-sign
+        working-directory: upstream
+        run: |
+          IPA="scratch/t52/xenios_ios_iphone_ipad.ipa"
+          TMP="$(mktemp -d)"
+          ditto -x -k "$IPA" "$TMP"
+          APP="$(find "$TMP/Payload" -maxdepth 1 -name '*.app' -type d | head -n1)"
+          /usr/libexec/PlistBuddy -c "Delete :CFBundleDisplayName" "$APP/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string XeniOS iOS16 T52" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Delete :CFBundleVersion" "$APP/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 9849.52" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Delete :MinimumOSVersion" "$APP/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string 16.0" "$APP/Info.plist"
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -name '*.dylib' -type f -print0 | \
+              xargs -0 -I{} codesign --force --sign - --timestamp=none "{}"
+          fi
+          codesign --force --sign - --timestamp=none \
+            --entitlements xenia_ios.entitlements "$APP"
+          rm -f "$IPA"
+          (cd "$TMP" && zip -qry "$GITHUB_WORKSPACE/upstream/$IPA" Payload)
+          shasum -a 256 "$IPA"
+
+      - name: Inspect embedded Metal target strings
+        working-directory: upstream
+        run: |
+          IPA="scratch/t52/xenios_ios_iphone_ipad.ipa"
+          TMP="$(mktemp -d)"
+          ditto -x -k "$IPA" "$TMP"
+          APP="$(find "$TMP/Payload" -maxdepth 1 -name '*.app' -type d | head -n1)"
+          echo "Main executable:"
+          xcrun vtool -show-build "$APP/XeniOS"
+          echo "Metal AIR target strings:"
+          strings "$APP/XeniOS" | grep -E 'air64_v[0-9]+-apple-ios' | sort | uniq -c | head -50 || true
+
+      - name: Upload T52 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: XeniOS-iOS16-T52-phase-playback-pacing
+          path: upstream/scratch/t52/xenios_ios_iphone_ipad.ipa
+          if-no-files-found: error
